@@ -1,6 +1,5 @@
 from crewai import Crew, Process, Task
-from crewai.flow import Flow, listen, start
-
+from crewai.flow import Flow, listen, router, start, or_
 from datapilot.agents import create_all_agents
 from datapilot.flows.state import AnalyticsState
 from datapilot.schemas.plan import AnalysisPlan
@@ -19,7 +18,7 @@ from datapilot.database.metadata import (
 MAX_RETRIES = 2
 from datapilot.visualization.charts import build_sales_charts
 from datapilot.schemas.charts import DashboardOutput
-
+from datapilot.flows.task_executor import execute_plan
 
 class AnalyticsFlow(Flow[AnalyticsState]):
 
@@ -52,12 +51,38 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
             {question}
 
-            The plan must:
-            - Identify the business objective.
-            - Break the investigation into actionable tasks.
-            - Assign tasks to the appropriate agents.
-            - Identify dependencies between tasks.
-            - Focus on evidence that can be retrieved from the sales database.
+            Your responsibilities:
+            1. Identify the business objective.
+            2. Break the investigation into actionable tasks.
+            3. Assign each task to the appropriate specialist.
+            4. Identify dependencies between tasks.
+            5. Focus on evidence available in the sales database.
+
+            Agent selection rules:
+
+            - data_engineer:
+            Required for retrieving relevant data from PostgreSQL.
+
+            - analyst:
+            Required for calculating and interpreting business results.
+
+            - dashboard:
+            Optional.
+            Include this agent only when:
+            a. The user explicitly requests a chart, graph, or dashboard.
+            b. A visualization would materially improve the requested analysis.
+
+            Do not create unnecessary dashboard tasks for questions that only
+            require a textual or numerical answer.
+
+            Dependency rules:
+            - Every task must have a unique task_id.
+            - Dependencies must reference existing task IDs.
+            - Dashboard tasks must depend on the relevant analytical task.
+            - Tasks must not depend on themselves.
+            - Avoid circular dependencies.
+
+            Do not assign QA tasks. QA is always executed by the system.
             """,
             expected_output="A valid structured AnalysisPlan.",
             agent=planner,
@@ -75,7 +100,46 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         if result.pydantic is None:
             raise ValueError("Planner did not return a valid AnalysisPlan.")
+        plan = result.pydantic
 
+        task_ids = [task.task_id for task in plan.tasks]
+
+        # Check duplicate task IDs.
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("Planner generated duplicate task IDs.")
+
+        known_ids = set(task_ids)
+
+        # Check dependencies.
+        for task in plan.tasks:
+            for dependency in task.dependencies:
+                if dependency not in known_ids:
+                    raise ValueError(
+                        f"Task {task.task_id} has unknown dependency: "
+                        f"{dependency}"
+                    )
+
+            if task.task_id in task.dependencies:
+                raise ValueError(
+                    f"Task {task.task_id} cannot depend on itself."
+                )
+
+            # Check mandatory agents.
+            required_agents = {
+                task.assigned_agent
+                for task in plan.tasks
+            }
+
+            mandatory_agents = {"data_engineer", "analyst"}
+
+            missing_agents = mandatory_agents - required_agents
+
+            if missing_agents:
+                raise ValueError(
+                    f"Planner omitted mandatory agents: {missing_agents}"
+                )
+
+            self.state.plan = plan
         self.state.plan = result.pydantic
         self.state.current_stage = "data_engineering"
         save_analysis_run(self.state)
@@ -90,180 +154,60 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         return result.pydantic
 
     @listen(create_plan)
-    def retrieve_data(self, plan: AnalysisPlan):
-        """Ask the Data Engineer to retrieve the required data."""
+    def execute_planned_tasks(self, plan: AnalysisPlan):
+        """Execute exactly the tasks defined by the Planner."""
 
-        agents = create_all_agents()
-        engineer = agents["data_engineer"]
+        print("\n[Flow] Starting Planner-driven execution")
 
-        task = Task(
-            description=f"""
-            Business question:
-            {self.state.user_question}
-
-            Analysis plan:
-            {plan.model_dump_json(indent=2)}
-
-            Use the PostgreSQL Read-Only Query Tool to retrieve
-            the data needed to answer the question.
-
-            Requirements:
-            - Inspect the database if necessary.
-            - Use read-only SQL.
-            - Do not invent query results.
-            - Return the SQL queries and their actual results.
-            - Explain what each result represents.
-            """,
-            expected_output=(
-                "SQL queries, actual database results, "
-                "and a concise explanation of the retrieved data."
-            ),
-            agent=engineer,
+        result = execute_plan(
+            plan=plan,
+            state=self.state,
         )
 
-        crew = Crew(
-            agents=[engineer],
-            tasks=[task],
-            process=Process.sequential,
-            verbose=True,
+        print("\n[Flow] All planned tasks completed")
+
+        return result
+
+    @listen(execute_planned_tasks)
+    def route_after_analysis(self) -> str:
+        """Decide whether dashboard generation is required."""
+
+        if self.state.plan is None:
+            raise ValueError("Analysis plan is missing.")
+
+        dashboard_required = any(
+            task.assigned_agent == "dashboard"
+            for task in self.state.plan.tasks
         )
 
-        result = crew.kickoff()
+        if dashboard_required:
+            print("[Flow] Dashboard generation required")
+            return "dashboard_required"
 
-        self.state.query_results = result.raw
-        self.state.current_stage = "analysis"
-        save_analysis_run(self.state)
+        print("[Flow] Dashboard generation skipped")
+
+        self.state.chart_specs = []
 
         save_agent_event(
             run_id=self.state.run_id,
-            stage="data_engineering",
-            event_type="completed",
-            message="Database retrieval completed.",
+            stage="dashboard",
+            event_type="skipped",
+            message="Dashboard was not required by the analysis plan.",
         )
-        print("[Data Engineer] Database retrieval completed")
-        return result.raw
-
-    @listen(retrieve_data)
-    def analyze_results(self, query_results: str): 
-        """Calculate metrics and ask the Analyst to interpret them."""
-
-        # 1. Load the aggregated sales dataset.
-        df = load_sales_data()
-
-        # 2. Calculate metrics using Python.
-        metrics = calculate_monthly_revenue(df)
-        self.state.metrics = metrics
-        # 3. Generate chart specifications.
-        chart_specs = build_sales_charts(df)
-
-        self.state.chart_specs = [
-            chart.model_dump()
-            for chart in chart_specs
-        ]
-
-        # 4. Prepare verified results for the Analyst.
-        metrics_json = json.dumps(metrics, indent=2)
-
-        charts_json = json.dumps(
-            self.state.chart_specs,
-            indent=2,
-        )
-
-        agents = create_all_agents()
-        analyst = agents["analyst"]
-
-        task = Task(
-            description=f"""
-            Answer this business question:
-
-            {self.state.user_question}
-
-            Retrieved database results:
-            {query_results}
-
-            Verified Python-calculated metrics:
-            {metrics_json}
-
-            Available chart specifications:
-            {charts_json}
-
-            Analyze the business results:
-            - Identify relevant regional and category patterns.
-            - Use the supplied calculated metrics.
-            - Distinguish observed facts from possible explanations.
-            - Do not invent numbers or claim causation without evidence.
-            """,
-            expected_output=(
-                "A structured analytical report with KPIs, "
-                "findings, evidence, and conclusions."
-            ),
-            agent=analyst,
-        )
-
-        crew = Crew(
-            agents=[analyst],
-            tasks=[task],
-            process=Process.sequential,
-            verbose=True,
-        )
-
-        result = crew.kickoff()
-
-        self.state.analysis = result.raw
-        self.state.current_stage = "quality_assurance"
 
         save_analysis_run(self.state)
 
-        return result.raw
+        return "dashboard_skipped"
 
-    @listen(analyze_results)
-    def generate_dashboard(self, analysis_result):
-        agents = create_all_agents()
-        dashboard_agent = agents["dashboard"]
+    @listen("dashboard_skipped")
+    def skip_dashboard(self):
+        """Continue without generating visualizations."""
 
-        task = Task(
-            description=f"""
-            Design a dashboard based on the following analysis.
+        self.state.chart_specs = []
 
-            Business question:
-            {self.state.user_question}
+        return "Dashboard skipped"
 
-            Analysis results:
-            {analysis_result}
-
-            Available metrics:
-            {self.state.metrics}
-
-            Requirements:
-            1. Select appropriate chart types.
-            2. Use only columns available in the analytical data.
-            3. Produce useful chart titles and axis labels.
-            4. Return structured chart specifications.
-            """,
-            expected_output=(
-                "A structured dashboard containing chart specifications."
-            ),
-            agent=dashboard_agent,
-            output_pydantic=DashboardOutput,
-        )
-
-        crew = Crew(
-            agents=[dashboard_agent],
-            tasks=[task],
-            verbose=True,
-        )
-
-        result = crew.kickoff()
-
-        dashboard_output = result.pydantic
-
-        if dashboard_output is None:
-            raise ValueError("Dashboard Agent returned no structured output.")
-
-        self.state.chart_specs = dashboard_output
-        return dashboard_output
-
-    @listen(generate_dashboard)
+    @listen(or_(generate_dashboard, skip_dashboard))
     def review_and_correct(self, initial_analysis: str):
         """Review the report and request bounded corrections."""
 
