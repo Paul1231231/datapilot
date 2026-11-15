@@ -1,6 +1,6 @@
 import argparse
 
-from datapilot.flows.analytics_flow import AnalyticsFlow
+from datapilot.flows.analytics_flow_old import AnalyticsFlow
 
 
 def main():
