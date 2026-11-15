@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from datapilot.schemas.plan import AnalysisPlan
 
+from datapilot.schemas.qa import QAResult
 
 class AnalyticsState(BaseModel):
     run_id: str = Field(default_factory=lambda: str(uuid4()))
@@ -20,5 +21,6 @@ class AnalyticsState(BaseModel):
     status: str = "pending"
     current_stage: str = "initialization"
     error: str | None = None
-
+    metrics: dict[str, Any] = {}
+    qa_result: QAResult | None = None
     retry_count: int = 0

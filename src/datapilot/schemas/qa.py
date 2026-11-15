@@ -16,5 +16,5 @@ class QAResult(BaseModel):
         "medium",
         "high",
     ]
-
+    summary: str 
     correction_instructions: str = ""

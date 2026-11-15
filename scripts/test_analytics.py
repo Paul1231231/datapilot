@@ -1,28 +1,26 @@
 from datapilot.analytics.sales import (
     load_sales_data,
-    calculate_quarterly_revenue,
-    calculate_regional_revenue,
+    calculate_total_revenue,
+    calculate_monthly_revenue,
     calculate_category_revenue,
-    compare_q2_q3,
 )
 
 
 def main():
     df = load_sales_data()
 
-    print("\n========== SOURCE DATA ==========")
+    print("\n--- DATA OVERVIEW ---")
     print(df.head())
+    print("Rows:", len(df))
+    print("Date range:", df["order_date"].min(), "to", df["order_date"].max())
 
-    print("\n========== QUARTERLY REVENUE ==========")
-    print(calculate_quarterly_revenue(df))
+    print("\n--- TOTAL REVENUE ---")
+    print(calculate_total_revenue(df))
 
-    print("\n========== Q2 VS Q3 ==========")
-    print(compare_q2_q3(df))
+    print("\n--- MONTHLY REVENUE ---")
+    print(calculate_monthly_revenue(df))
 
-    print("\n========== REGIONAL REVENUE ==========")
-    print(calculate_regional_revenue(df))
-
-    print("\n========== CATEGORY REVENUE ==========")
+    print("\n--- CATEGORY REVENUE ---")
     print(calculate_category_revenue(df))
 
 

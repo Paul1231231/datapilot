@@ -9,8 +9,14 @@ import json
 
 from datapilot.analytics.sales import (
     load_sales_data,
-    compare_q2_q3,
+    calculate_monthly_revenue,
 )
+from datapilot.schemas.qa import QAResult
+from datapilot.database.metadata import (
+    save_analysis_run,
+    save_agent_event,
+)
+MAX_RETRIES = 2
 from datapilot.visualization.charts import build_sales_charts
 
 class AnalyticsFlow(Flow[AnalyticsState]):
@@ -70,7 +76,14 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         self.state.plan = result.pydantic
         self.state.current_stage = "data_engineering"
+        save_analysis_run(self.state)
 
+        save_agent_event(
+            run_id=self.state.run_id,
+            stage="planning",
+            event_type="completed",
+            message="Analysis plan created.",
+        )
         print("[Planner] Analysis plan created")
         return result.pydantic
 
@@ -117,7 +130,14 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         self.state.query_results = result.raw
         self.state.current_stage = "analysis"
+        save_analysis_run(self.state)
 
+        save_agent_event(
+            run_id=self.state.run_id,
+            stage="data_engineering",
+            event_type="completed",
+            message="Database retrieval completed.",
+        )
         print("[Data Engineer] Database retrieval completed")
         return result.raw
 
@@ -129,8 +149,8 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         df = load_sales_data()
 
         # 2. Calculate metrics using Python.
-        metrics = compare_q2_q3(df)
-
+        metrics = calculate_monthly_revenue(df)
+        self.state.metrics = metrics
         # 3. Generate chart specifications.
         chart_specs = build_sales_charts(df)
 
@@ -166,7 +186,6 @@ class AnalyticsFlow(Flow[AnalyticsState]):
             {charts_json}
 
             Analyze the business results:
-            - Explain the Q2 versus Q3 revenue difference.
             - Identify relevant regional and category patterns.
             - Use the supplied calculated metrics.
             - Distinguish observed facts from possible explanations.
@@ -189,7 +208,150 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         result = crew.kickoff()
 
         self.state.analysis = result.raw
-        self.state.current_stage = "completed"
-        self.state.status = "completed"
+        self.state.current_stage = "quality_assurance"
+
+        save_analysis_run(self.state)
 
         return result.raw
+
+    @listen(analyze_results)
+    def review_and_correct(self, initial_analysis: str):
+        """Review the report and request bounded corrections."""
+
+        agents = create_all_agents()
+        analyst = agents["analyst"]
+        qa_agent = agents["qa"]
+
+        current_report = initial_analysis
+
+        for attempt in range(MAX_RETRIES + 1):
+            self.state.current_stage = "quality_assurance"
+
+            qa_task = Task(
+                description=f"""
+                Review this analytical report.
+
+                Original business question:
+                {self.state.user_question}
+
+                Verified metrics:
+                {self.state.metrics}
+
+                Retrieved data:
+                {self.state.query_results}
+
+                Chart specifications:
+                {self.state.chart_specs}
+
+                Analytical report:
+                {current_report}
+
+                Check:
+                1. Numerical claims match the verified metrics.
+                2. Conclusions are supported by retrieved data.
+                3. Facts and hypotheses are distinguished.
+                4. The report answers the original question.
+                5. The report does not invent evidence.
+
+                Return passed=True only when the report is acceptable.
+                If it fails, provide specific correction instructions.
+                """,
+                expected_output="A structured QAResult.",
+                agent=qa_agent,
+                output_pydantic=QAResult,
+            )
+
+            qa_crew = Crew(
+                agents=[qa_agent],
+                tasks=[qa_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+
+            qa_result = qa_crew.kickoff()
+
+            result = qa_result.pydantic
+
+            if result is None:
+                raise ValueError("QA Agent returned no valid QAResult.")
+
+            self.state.qa_result = result
+            self.state.analysis = current_report
+            self.state.retry_count = attempt
+
+            save_agent_event(
+                run_id=self.state.run_id,
+                stage="quality_assurance",
+                event_type="qa_review",
+                message=result.summary,
+            )
+
+            if result.passed:
+                self.state.status = "completed"
+                self.state.current_stage = "completed"
+
+                save_analysis_run(self.state)
+
+                print("[QA] Report approved")
+                return current_report
+
+            print(
+                f"[QA] Rejected report. "
+                f"Correction attempt {attempt + 1}/{MAX_RETRIES}"
+            )
+
+            if attempt == MAX_RETRIES:
+                break
+
+            # Give the Analyst specific feedback.
+            correction_task = Task(
+                description=f"""
+                Revise your previous analytical report.
+
+                Original business question:
+                {self.state.user_question}
+
+                Previous report:
+                {current_report}
+
+                QA issues:
+                {result.issues}
+
+                Required corrections:
+                {result.correction_instructions}
+
+                Verified metrics:
+                {self.state.metrics}
+
+                Retrieved data:
+                {self.state.query_results}
+
+                Correct the identified problems.
+                Do not invent figures or unsupported explanations.
+                Return the complete revised report.
+                """,
+                expected_output="A corrected analytical report.",
+                agent=analyst,
+            )
+
+            correction_crew = Crew(
+                agents=[analyst],
+                tasks=[correction_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+
+            correction_result = correction_crew.kickoff()
+            current_report = correction_result.raw
+
+        self.state.status = "failed"
+        self.state.current_stage = "failed"
+        self.state.analysis = current_report
+        self.state.error = (
+            "QA rejected the report after the maximum correction attempts."
+        )
+
+        save_analysis_run(self.state)
+
+        print("[QA] Maximum correction attempts reached")
+        return current_report
