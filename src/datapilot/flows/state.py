@@ -24,6 +24,4 @@ class AnalyticsState(BaseModel):
     metrics: dict[str, Any] = {}
     qa_result: QAResult | None = None
     retry_count: int = 0
-    task_results: list[dict[str, Any]] = Field(
-        
-    )
+    task_results: list[dict[str, Any]] = Field(default_factory=list)

@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd
 from datapilot.tools.database import execute_read_only_query
 import json
@@ -57,3 +59,23 @@ def calculate_category_revenue(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return result
+
+
+def compute_verified_metrics(df: pd.DataFrame | None = None) -> dict[str, Any]:
+    """Calculate the figures the analyst and QA must treat as facts."""
+
+    if df is None:
+        df = load_sales_data()
+
+    monthly = calculate_monthly_revenue(df)
+    category = calculate_category_revenue(df)
+    top_category = None
+    if not category.empty:
+        top_category = str(category.iloc[0]["category"])
+
+    return {
+        "total_revenue": calculate_total_revenue(df),
+        "top_category": top_category,
+        "monthly_revenue": monthly.to_dict(orient="records"),
+        "category_revenue": category.to_dict(orient="records"),
+    }

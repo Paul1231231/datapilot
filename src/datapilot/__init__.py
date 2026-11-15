@@ -1,2 +1,4 @@
 def main() -> None:
-    print("Hello from datapilot!")
+    from datapilot.cli import main as cli_main
+
+    cli_main()

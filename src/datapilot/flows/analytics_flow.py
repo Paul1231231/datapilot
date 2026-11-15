@@ -1,24 +1,24 @@
 from crewai import Crew, Process, Task
-from crewai.flow import Flow, listen, router, start, or_
+from crewai.flow import Flow, listen, start
+
 from datapilot.agents import create_all_agents
-from datapilot.flows.state import AnalyticsState
-from datapilot.schemas.plan import AnalysisPlan
-
-import json
-
-from datapilot.analytics.sales import (
-    load_sales_data,
-    calculate_monthly_revenue,
-)
-from datapilot.schemas.qa import QAResult
 from datapilot.database.metadata import (
-    save_analysis_run,
     save_agent_event,
+    save_analysis_run,
 )
+from datapilot.flows.state import AnalyticsState
+from datapilot.flows.task_executor import (
+    execute_plan,
+    require_mandatory_agents,
+    select_correction_agent,
+    tasks_ready_for_qa,
+    validate_plan,
+)
+from datapilot.schemas.plan import AnalysisPlan
+from datapilot.schemas.qa import QAResult
+
 MAX_RETRIES = 2
-from datapilot.visualization.charts import build_sales_charts
-from datapilot.schemas.charts import DashboardOutput
-from datapilot.flows.task_executor import execute_plan
+
 
 class AnalyticsFlow(Flow[AnalyticsState]):
 
@@ -65,6 +65,8 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
             - analyst:
             Required for calculating and interpreting business results.
+            Python calculates the verified metrics. The analyst explains
+            those figures and must not replace them.
 
             - dashboard:
             Optional.
@@ -78,6 +80,7 @@ class AnalyticsFlow(Flow[AnalyticsState]):
             Dependency rules:
             - Every task must have a unique task_id.
             - Dependencies must reference existing task IDs.
+            - A dependency must be an earlier task.
             - Dashboard tasks must depend on the relevant analytical task.
             - Tasks must not depend on themselves.
             - Avoid circular dependencies.
@@ -100,47 +103,12 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         if result.pydantic is None:
             raise ValueError("Planner did not return a valid AnalysisPlan.")
+
         plan = result.pydantic
+        validate_plan(plan)
+        require_mandatory_agents(plan)
 
-        task_ids = [task.task_id for task in plan.tasks]
-
-        # Check duplicate task IDs.
-        if len(task_ids) != len(set(task_ids)):
-            raise ValueError("Planner generated duplicate task IDs.")
-
-        known_ids = set(task_ids)
-
-        # Check dependencies.
-        for task in plan.tasks:
-            for dependency in task.dependencies:
-                if dependency not in known_ids:
-                    raise ValueError(
-                        f"Task {task.task_id} has unknown dependency: "
-                        f"{dependency}"
-                    )
-
-            if task.task_id in task.dependencies:
-                raise ValueError(
-                    f"Task {task.task_id} cannot depend on itself."
-                )
-
-            # Check mandatory agents.
-            required_agents = {
-                task.assigned_agent
-                for task in plan.tasks
-            }
-
-            mandatory_agents = {"data_engineer", "analyst"}
-
-            missing_agents = mandatory_agents - required_agents
-
-            if missing_agents:
-                raise ValueError(
-                    f"Planner omitted mandatory agents: {missing_agents}"
-                )
-
-            self.state.plan = plan
-        self.state.plan = result.pydantic
+        self.state.plan = plan
         self.state.current_stage = "data_engineering"
         save_analysis_run(self.state)
 
@@ -151,7 +119,7 @@ class AnalyticsFlow(Flow[AnalyticsState]):
             message="Analysis plan created.",
         )
         print("[Planner] Analysis plan created")
-        return result.pydantic
+        return plan
 
     @listen(create_plan)
     def execute_planned_tasks(self, plan: AnalysisPlan):
@@ -169,50 +137,15 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         return result
 
     @listen(execute_planned_tasks)
-    def route_after_analysis(self) -> str:
-        """Decide whether dashboard generation is required."""
-
-        if self.state.plan is None:
-            raise ValueError("Analysis plan is missing.")
-
-        dashboard_required = any(
-            task.assigned_agent == "dashboard"
-            for task in self.state.plan.tasks
-        )
-
-        if dashboard_required:
-            print("[Flow] Dashboard generation required")
-            return "dashboard_required"
-
-        print("[Flow] Dashboard generation skipped")
-
-        self.state.chart_specs = []
-
-        save_agent_event(
-            run_id=self.state.run_id,
-            stage="dashboard",
-            event_type="skipped",
-            message="Dashboard was not required by the analysis plan.",
-        )
-
-        save_analysis_run(self.state)
-
-        return "dashboard_skipped"
-
-    @listen("dashboard_skipped")
-    def skip_dashboard(self):
-        """Continue without generating visualizations."""
-
-        self.state.chart_specs = []
-
-        return "Dashboard skipped"
-
-    @listen(or_(generate_dashboard, skip_dashboard))
     def review_and_correct(self, initial_analysis: str):
         """Review the report and request bounded corrections."""
 
+        if not tasks_ready_for_qa(self.state):
+            raise RuntimeError(
+                "QA runs only after every planned task completes."
+            )
+
         agents = create_all_agents()
-        analyst = agents["analyst"]
         qa_agent = agents["qa"]
 
         current_report = initial_analysis
@@ -248,6 +181,12 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
                 Return passed=True only when the report is acceptable.
                 If it fails, provide specific correction instructions.
+                Set responsible_agent to the specialist who should revise
+                the work:
+                - data_engineer when the retrieved evidence is wrong or missing
+                - analyst when the interpretation or numerical claims are wrong
+                - dashboard when the chart specifications are wrong
+                Use analyst when more than one area is wrong.
                 """,
                 expected_output="A structured QAResult.",
                 agent=qa_agent,
@@ -296,10 +235,13 @@ class AnalyticsFlow(Flow[AnalyticsState]):
             if attempt == MAX_RETRIES:
                 break
 
-            # Give the Analyst specific feedback.
+            agent_name = select_correction_agent(result)
+            correction_agent = agents[agent_name]
+
             correction_task = Task(
                 description=f"""
-                Revise your previous analytical report.
+                You are the {agent_name} specialist.
+                Revise the analysis so it satisfies QA.
 
                 Original business question:
                 {self.state.user_question}
@@ -313,22 +255,23 @@ class AnalyticsFlow(Flow[AnalyticsState]):
                 Required corrections:
                 {result.correction_instructions}
 
-                Verified metrics:
+                Verified metrics, calculated by Python:
                 {self.state.metrics}
 
                 Retrieved data:
                 {self.state.query_results}
 
-                Correct the identified problems.
+                Correct the identified problems in your specialty.
+                Use the verified metrics exactly.
                 Do not invent figures or unsupported explanations.
                 Return the complete revised report.
                 """,
                 expected_output="A corrected analytical report.",
-                agent=analyst,
+                agent=correction_agent,
             )
 
             correction_crew = Crew(
-                agents=[analyst],
+                agents=[correction_agent],
                 tasks=[correction_task],
                 process=Process.sequential,
                 verbose=True,
@@ -348,5 +291,3 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         print("[QA] Maximum correction attempts reached")
         return current_report
-
-    

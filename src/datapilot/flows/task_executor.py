@@ -1,12 +1,13 @@
-
 import json
 from typing import Any
 
 from crewai import Crew, Process, Task
 
 from datapilot.agents import create_all_agents
+from datapilot.analytics.sales import compute_verified_metrics
 from datapilot.schemas.plan import AnalysisPlan
 from datapilot.schemas.charts import DashboardOutput
+from datapilot.schemas.qa import QAResult
 from datapilot.flows.state import AnalyticsState
 from datapilot.database.metadata import (
     save_analysis_run,
@@ -18,6 +19,11 @@ SUPPORTED_AGENTS = {
     "data_engineer",
     "analyst",
     "dashboard",
+}
+
+MANDATORY_AGENTS = {
+    "data_engineer",
+    "analyst",
 }
 
 
@@ -58,16 +64,68 @@ def validate_plan(plan: AnalysisPlan) -> None:
         seen_task_ids.add(task.task_id)
 
 
+def require_mandatory_agents(plan: AnalysisPlan) -> None:
+    """A business analysis plan must retrieve data and interpret it."""
+
+    assigned = {task.assigned_agent for task in plan.tasks}
+    missing = MANDATORY_AGENTS - assigned
+
+    if missing:
+        raise ValueError(
+            "Planner omitted mandatory agents: "
+            f"{sorted(missing)}"
+        )
+
+
+def select_correction_agent(result: QAResult) -> str:
+    """Send a QA rejection back to the specialist who owns the issue."""
+
+    if result.responsible_agent in SUPPORTED_AGENTS:
+        return result.responsible_agent
+    return "analyst"
+
+
+def tasks_ready_for_qa(state: AnalyticsState) -> bool:
+    """QA reviews a run only after every planned task has completed."""
+
+    if state.status == "failed" or state.plan is None:
+        return False
+
+    completed = [
+        record
+        for record in state.task_results
+        if record.get("status") == "completed"
+    ]
+    return len(completed) == len(state.plan.tasks)
+
+
+def _context_output(output: Any, limit: int = 4000) -> Any:
+    text = output if isinstance(output, str) else json.dumps(output, default=str)
+    if len(text) <= limit:
+        return output
+    return text[:limit] + "...[truncated]"
+
+
 def build_task_context(
     question: str,
     completed_tasks: list[dict[str, Any]],
+    metrics: dict[str, Any],
 ) -> str:
-    """Build context from previously completed tasks."""
+    """Build context from verified metrics and previously completed tasks."""
+
+    context_tasks = [
+        {
+            **task,
+            "output": _context_output(task.get("output")),
+        }
+        for task in completed_tasks
+    ]
 
     return json.dumps(
         {
             "business_question": question,
-            "completed_tasks": completed_tasks,
+            "verified_metrics": metrics,
+            "completed_tasks": context_tasks,
         },
         indent=2,
         default=str,
@@ -99,7 +157,9 @@ def execute_single_task(
         3. Do not skip the assigned task.
         4. Use actual database results and available evidence.
         5. Do not invent results.
-        6. Clearly report the work completed and its evidence.
+        6. When verified_metrics are present, treat them as the only
+           source of numerical facts. Do not recompute or replace them.
+        7. Clearly report the work completed and its evidence.
         """,
         expected_output=expected_output,
         agent=agent,
@@ -116,6 +176,37 @@ def execute_single_task(
     return crew.kickoff()
 
 
+def record_task_failure(
+    state: AnalyticsState,
+    planned_task,
+    exc: Exception,
+) -> None:
+    """Persist a failed task and stop the run from looking successful."""
+
+    state.status = "failed"
+    state.current_stage = planned_task.assigned_agent
+    state.error = str(exc)
+    state.task_results.append(
+        {
+            "task_id": planned_task.task_id,
+            "description": planned_task.description,
+            "assigned_agent": planned_task.assigned_agent,
+            "status": "failed",
+            "output": str(exc),
+        }
+    )
+
+    save_analysis_run(state)
+    save_agent_event(
+        run_id=state.run_id,
+        stage=planned_task.assigned_agent,
+        event_type="task_failed",
+        message=(
+            f"Task {planned_task.task_id} failed: {exc}"
+        ),
+    )
+
+
 def execute_plan(
     plan: AnalysisPlan,
     state: AnalyticsState,
@@ -130,16 +221,30 @@ def execute_plan(
 
     validate_plan(plan)
 
-    # Create agent instances once and reuse them.
+    state.task_results = []
+    state.chart_specs = []
+
+    try:
+        state.metrics = compute_verified_metrics()
+    except Exception as exc:
+        state.status = "failed"
+        state.current_stage = "metrics"
+        state.error = f"Could not compute verified metrics: {exc}"
+        save_analysis_run(state)
+        save_agent_event(
+            run_id=state.run_id,
+            stage="metrics",
+            event_type="task_failed",
+            message=state.error,
+        )
+        raise
+
     agents = create_all_agents()
 
     completed_tasks: list[dict[str, Any]] = []
 
     engineer_results = []
     analyst_results = []
-
-    state.task_results = []
-    state.chart_specs = []
 
     save_agent_event(
         run_id=state.run_id,
@@ -166,6 +271,7 @@ def execute_plan(
         context = build_task_context(
             state.user_question,
             completed_tasks,
+            state.metrics,
         )
 
         output_schema = None
@@ -175,6 +281,12 @@ def execute_plan(
             "including evidence and relevant findings."
         )
 
+        if agent_name == "analyst":
+            expected_output = (
+                "An analytical report that explains the verified "
+                "metrics. Use those figures exactly."
+            )
+
         if agent_name == "dashboard":
             output_schema = DashboardOutput
             expected_output = (
@@ -182,33 +294,35 @@ def execute_plan(
                 "chart specifications."
             )
 
-        result = execute_single_task(
-            agent=agent,
-            task_description=planned_task.description,
-            context=context,
-            expected_output=expected_output,
-            output_pydantic=output_schema,
-        )
-
-        # Validate structured Dashboard output.
-        if agent_name == "dashboard":
-            if result.pydantic is None:
-                raise ValueError(
-                    f"Dashboard task {planned_task.task_id} "
-                    "returned no valid structured output."
-                )
-
-            task_output = result.pydantic.model_dump()
-
-            state.chart_specs.extend(
-                chart.model_dump()
-                for chart in result.pydantic.charts
+        try:
+            result = execute_single_task(
+                agent=agent,
+                task_description=planned_task.description,
+                context=context,
+                expected_output=expected_output,
+                output_pydantic=output_schema,
             )
 
-        else:
-            task_output = result.raw
+            if agent_name == "dashboard":
+                if result.pydantic is None:
+                    raise ValueError(
+                        f"Dashboard task {planned_task.task_id} "
+                        "returned no valid structured output."
+                    )
 
-        # Record the completed task.
+                task_output = result.pydantic.model_dump()
+
+                state.chart_specs.extend(
+                    chart.model_dump()
+                    for chart in result.pydantic.charts
+                )
+
+            else:
+                task_output = result.raw
+        except Exception as exc:
+            record_task_failure(state, planned_task, exc)
+            raise
+
         record = {
             "task_id": planned_task.task_id,
             "description": planned_task.description,
@@ -242,7 +356,6 @@ def execute_plan(
             f"[Completed] {planned_task.task_id}"
         )
 
-    # Consolidate outputs for the existing QA stage.
     state.query_results = json.dumps(
         engineer_results,
         indent=2,
@@ -254,8 +367,6 @@ def execute_plan(
         for result in analyst_results
     )
 
-    # If there was no Analyst task, QA still receives
-    # the completed task outputs as its review material.
     if not state.analysis:
         state.analysis = json.dumps(
             completed_tasks,

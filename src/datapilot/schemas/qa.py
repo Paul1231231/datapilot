@@ -16,5 +16,10 @@ class QAResult(BaseModel):
         "medium",
         "high",
     ]
-    summary: str 
+    summary: str
     correction_instructions: str = ""
+    responsible_agent: Literal[
+        "data_engineer",
+        "analyst",
+        "dashboard",
+    ] = "analyst"

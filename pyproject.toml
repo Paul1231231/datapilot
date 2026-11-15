@@ -1,7 +1,7 @@
 [project]
 name = "datapilot"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local planner-driven analytics for natural-language business questions."
 readme = "README.md"
 authors = [
     { name = "paul1231231", email = "pokpokli557@gmail.com" }
@@ -9,7 +9,6 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "crewai[litellm]>=1.15.41",
-    "fastapi>=0.163.0",
     "httpx>=0.28.1",
     "pandas>=3.1.1",
     "plotly>=7.1.0",
@@ -20,7 +19,6 @@ dependencies = [
     "sqlalchemy>=2.1.8",
     "sqlglot>=30.31.0",
     "streamlit>=1.67.0",
-    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
