@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen3:8b"
 
     database_url: str
+    database_readonly_url: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
