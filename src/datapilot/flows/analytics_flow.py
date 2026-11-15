@@ -18,6 +18,8 @@ from datapilot.database.metadata import (
 )
 MAX_RETRIES = 2
 from datapilot.visualization.charts import build_sales_charts
+from datapilot.schemas.charts import DashboardOutput
+
 
 class AnalyticsFlow(Flow[AnalyticsState]):
 
@@ -215,6 +217,53 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         return result.raw
 
     @listen(analyze_results)
+    def generate_dashboard(self, analysis_result):
+        agents = create_all_agents()
+        dashboard_agent = agents["dashboard"]
+
+        task = Task(
+            description=f"""
+            Design a dashboard based on the following analysis.
+
+            Business question:
+            {self.state.user_question}
+
+            Analysis results:
+            {analysis_result}
+
+            Available metrics:
+            {self.state.metrics}
+
+            Requirements:
+            1. Select appropriate chart types.
+            2. Use only columns available in the analytical data.
+            3. Produce useful chart titles and axis labels.
+            4. Return structured chart specifications.
+            """,
+            expected_output=(
+                "A structured dashboard containing chart specifications."
+            ),
+            agent=dashboard_agent,
+            output_pydantic=DashboardOutput,
+        )
+
+        crew = Crew(
+            agents=[dashboard_agent],
+            tasks=[task],
+            verbose=True,
+        )
+
+        result = crew.kickoff()
+
+        dashboard_output = result.pydantic
+
+        if dashboard_output is None:
+            raise ValueError("Dashboard Agent returned no structured output.")
+
+        self.state.chart_specs = dashboard_output
+        return dashboard_output
+
+    @listen(generate_dashboard)
     def review_and_correct(self, initial_analysis: str):
         """Review the report and request bounded corrections."""
 
@@ -355,3 +404,5 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
         print("[QA] Maximum correction attempts reached")
         return current_report
+
+    

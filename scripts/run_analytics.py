@@ -1,54 +1,29 @@
-from datapilot.database.metadata import (
-    initialize_metadata_tables,
-    save_analysis_run,
-    save_agent_event,
-)
+import argparse
 
 from datapilot.flows.analytics_flow import AnalyticsFlow
 
 
 def main():
-    initialize_metadata_tables()
-
-    question = "Why did Q3 revenue decrease compared with Q2?"
-
-    flow = AnalyticsFlow()
-
-    # Create the state and persist the initial run.
-    flow.state.user_question = question
-    save_analysis_run(flow.state)
-
-    save_agent_event(
-        run_id=flow.state.run_id,
-        stage="initialization",
-        event_type="run_started",
-        message="Analytics workflow started.",
+    parser = argparse.ArgumentParser(
+        description="Run DataPilot analytics."
     )
 
-    try:
-        result = flow.kickoff()
+    parser.add_argument(
+        "--question",
+        type=str,
+        required=True,
+        help="Business question to analyze",
+    )
 
-        print("\n========== DATAPILOT RESULT ==========")
-        print(result)
+    args = parser.parse_args()
 
-    except Exception as exc:
-        flow.state.status = "failed"
-        flow.state.current_stage = "failed"
-        flow.state.error = str(exc)
+    flow = AnalyticsFlow()
+    flow.state.user_question = args.question
 
-        save_analysis_run(flow.state)
+    result = flow.kickoff()
 
-        save_agent_event(
-            run_id=flow.state.run_id,
-            stage="workflow",
-            event_type="run_failed",
-            message=str(exc),
-        )
-
-        raise
-
-    print("\n========== FINAL WORKFLOW STATE ==========")
-    print(flow.state.model_dump_json(indent=2))
+    print("\n===== DATAPILOT RESULT =====")
+    print(result)
 
 
 if __name__ == "__main__":
