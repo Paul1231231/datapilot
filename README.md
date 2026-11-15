@@ -404,6 +404,9 @@ Run the test suite:
 uv run pytest -v
 ```
 
+GitHub Actions runs unit and evaluation tests on every push and pull request;
+integration tests run against PostgreSQL on `main` / `master` and PRs (see `.github/workflows/ci.yml`).
+
 Run a specific test directory if present:
 
 ```bash
