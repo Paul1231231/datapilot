@@ -5,6 +5,13 @@ from datapilot.agents import create_all_agents
 from datapilot.flows.state import AnalyticsState
 from datapilot.schemas.plan import AnalysisPlan
 
+import json
+
+from datapilot.analytics.sales import (
+    load_sales_data,
+    compare_q2_q3,
+)
+from datapilot.visualization.charts import build_sales_charts
 
 class AnalyticsFlow(Flow[AnalyticsState]):
 
@@ -115,8 +122,30 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         return result.raw
 
     @listen(retrieve_data)
-    def analyze_results(self, query_results: str):
-        """Ask the Analyst to interpret the retrieved results."""
+    def analyze_results(self, query_results: str): 
+        """Calculate metrics and ask the Analyst to interpret them."""
+
+        # 1. Load the aggregated sales dataset.
+        df = load_sales_data()
+
+        # 2. Calculate metrics using Python.
+        metrics = compare_q2_q3(df)
+
+        # 3. Generate chart specifications.
+        chart_specs = build_sales_charts(df)
+
+        self.state.chart_specs = [
+            chart.model_dump()
+            for chart in chart_specs
+        ]
+
+        # 4. Prepare verified results for the Analyst.
+        metrics_json = json.dumps(metrics, indent=2)
+
+        charts_json = json.dumps(
+            self.state.chart_specs,
+            indent=2,
+        )
 
         agents = create_all_agents()
         analyst = agents["analyst"]
@@ -127,17 +156,21 @@ class AnalyticsFlow(Flow[AnalyticsState]):
 
             {self.state.user_question}
 
-            Analysis plan:
-            {self.state.plan.model_dump_json(indent=2)}
-
             Retrieved database results:
             {query_results}
 
-            Analyze the results:
-            - Calculate relevant KPIs and comparisons.
-            - Identify important trends and differences.
+            Verified Python-calculated metrics:
+            {metrics_json}
+
+            Available chart specifications:
+            {charts_json}
+
+            Analyze the business results:
+            - Explain the Q2 versus Q3 revenue difference.
+            - Identify relevant regional and category patterns.
+            - Use the supplied calculated metrics.
             - Distinguish observed facts from possible explanations.
-            - Do not invent figures or claim causation without evidence.
+            - Do not invent numbers or claim causation without evidence.
             """,
             expected_output=(
                 "A structured analytical report with KPIs, "
@@ -159,5 +192,4 @@ class AnalyticsFlow(Flow[AnalyticsState]):
         self.state.current_stage = "completed"
         self.state.status = "completed"
 
-        print("[Analyst] Analysis completed")
         return result.raw
